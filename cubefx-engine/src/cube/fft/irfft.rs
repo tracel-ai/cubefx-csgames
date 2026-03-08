@@ -55,9 +55,10 @@ pub fn irfft_launch<R: Runtime>(
     let vectorization = 1;
 
     let num_iter = signal.shape[0] * signal.shape[1];
-    let (cube_dim, cube_count, is_gpu) = cube_selection(&client.properties().hardware, num_iter);
+    let (cube_dim, cube_count, is_gpu) =
+        cube_selection(&client.properties().hardware, num_iter, true);
+    let num_samples = *signal.shape.last().unwrap();
 
-    let num_sampels = *signal.shape.last().unwrap();
     unsafe {
         irfft_kernel::launch_unchecked::<R>(
             &client,
@@ -66,7 +67,7 @@ pub fn irfft_launch<R: Runtime>(
             spectrum_re.as_tensor_arg(vectorization),
             spectrum_im.as_tensor_arg(vectorization),
             signal.as_tensor_arg(vectorization),
-            num_sampels,
+            num_samples,
             is_gpu,
             dtype,
         )
@@ -156,14 +157,7 @@ pub(crate) fn irfft_kernel_one_batch<F: Float>(
 
     // Normalize by number of samples
     for i in 0..num_samples {
-        spectrum_re[i] = spectrum_re[i] / F::cast_from(num_samples);
-        spectrum_im[i] = spectrum_im[i] / F::cast_from(num_samples);
-    }
-
-    // Write full real output
-    for i in 0..num_samples {
-        // Warning: this assumes that output_view have lines of 1 element
-        // If lines had more elements, the ith element would be duplicated as it is
-        signal_view.write(i, Line::cast_from(spectrum_re[i]));
+        let output = spectrum_re[i] / F::cast_from(num_samples);
+        signal_view.write(i, Line::cast_from(output));
     }
 }

@@ -10,16 +10,23 @@ pub use fft::*;
 pub(crate) use layout::*;
 pub use phase_shift::*;
 
-pub fn cube_selection(hw: &HardwareProperties, num_iter: usize) -> (CubeDim, CubeCount, bool) {
+pub fn cube_selection(
+    hw: &HardwareProperties,
+    num_iter: usize,
+    force_no_cube_dim_gpu: bool,
+) -> (CubeDim, CubeCount, bool) {
     let plane_size = hw.plane_size_min;
     let x = match hw.num_cpu_cores {
         Some(num_cores) => num_cores,
         None => {
-            return (
-                CubeDim::new_single(),
-                CubeCount::new_1d(num_iter as u32),
-                true,
-            );
+            if force_no_cube_dim_gpu {
+                return (
+                    CubeDim::new_single(),
+                    CubeCount::new_1d(num_iter as u32),
+                    force_no_cube_dim_gpu,
+                );
+            }
+            1
         }
     };
 

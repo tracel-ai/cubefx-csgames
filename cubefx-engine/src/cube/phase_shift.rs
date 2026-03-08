@@ -53,7 +53,7 @@ pub fn phase_shift_launch<R: Runtime>(
     dtype: StorageType,
 ) -> Result<(), LaunchError> {
     let num_iter = input_re.shape[0] * input_re.shape[1];
-    let (cube_dim, cube_count, _) = cube_selection(&client.properties().hardware, num_iter);
+    let (cube_dim, cube_count, _) = cube_selection(&client.properties().hardware, num_iter, false);
 
     let vectorization = 1;
 

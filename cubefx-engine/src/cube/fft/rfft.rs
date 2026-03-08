@@ -60,7 +60,8 @@ pub fn rfft_launch<R: Runtime>(
     dtype: StorageType,
 ) -> Result<(), LaunchError> {
     let num_iter = signal.shape[0] * signal.shape[1];
-    let (cube_dim, cube_count, is_gpu) = cube_selection(&client.properties().hardware, num_iter);
+    let (cube_dim, cube_count, is_gpu) =
+        cube_selection(&client.properties().hardware, num_iter, true);
     let num_samples = *signal.shape.last().unwrap();
     let vectorization_input = client
         .io_optimized_line_sizes(&dtype)
