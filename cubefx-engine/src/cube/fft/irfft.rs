@@ -55,7 +55,7 @@ pub fn irfft_launch<R: Runtime>(
     let vectorization = 1;
 
     let num_iter = signal.shape[0] * signal.shape[1];
-    let (cube_dim, cube_count) = cube_selection(&client.properties().hardware, num_iter);
+    let (cube_dim, cube_count, is_gpu) = cube_selection(&client.properties().hardware, num_iter);
 
     let num_sampels = *signal.shape.last().unwrap();
     unsafe {
@@ -67,6 +67,7 @@ pub fn irfft_launch<R: Runtime>(
             spectrum_im.as_tensor_arg(vectorization),
             signal.as_tensor_arg(vectorization),
             num_sampels,
+            is_gpu,
             dtype,
         )
     }
@@ -79,6 +80,7 @@ pub(crate) fn irfft_kernel<F: Float>(
     spectrums_im: &Tensor<Line<F>>,
     signal: &mut Tensor<Line<F>>,
     #[comptime] num_samples: usize,
+    #[comptime] is_gpu: bool,
     #[define(F)] _dtype: StorageType,
 ) {
     let num_batch = signal.shape(0) * signal.shape(1);
@@ -88,7 +90,14 @@ pub(crate) fn irfft_kernel<F: Float>(
         terminate!()
     }
 
-    irfft_kernel_one_batch(spectrums_re, spectrums_im, signal, batch_index, num_samples);
+    irfft_kernel_one_batch(
+        spectrums_re,
+        spectrums_im,
+        signal,
+        batch_index,
+        num_samples,
+        is_gpu,
+    );
 }
 
 #[cube(launch)]
@@ -102,6 +111,7 @@ pub(crate) fn irfft_kernel_one_batch<F: Float>(
     signal: &mut Tensor<Line<F>>,
     window_index: usize,
     #[comptime] num_samples: usize,
+    #[comptime] is_gpu: bool,
 ) {
     // The following code allow to ignore the batch index and assume only one window
     // - spectrums have shape: [num_freq_bins]
@@ -115,9 +125,16 @@ pub(crate) fn irfft_kernel_one_batch<F: Float>(
 
     let num_freq_bins = spectrums_re_view.shape();
 
-    // The shared memories are not vectorized because the inner FFT compute will need to work independantly on each element
-    let mut spectrum_re = Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
-    let mut spectrum_im = Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
+    let (mut spectrum_re, mut spectrum_im) = match is_gpu {
+        true => (
+            SharedMemory::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples)),
+            SharedMemory::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples)),
+        ),
+        false => (
+            Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples)),
+            Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples)),
+        ),
+    };
 
     // Load all the frequency bins to shared memory
     for i in 0..num_freq_bins {

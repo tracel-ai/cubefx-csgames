@@ -60,7 +60,7 @@ pub fn rfft_launch<R: Runtime>(
     dtype: StorageType,
 ) -> Result<(), LaunchError> {
     let num_iter = signal.shape[0] * signal.shape[1];
-    let (cube_dim, cube_count) = cube_selection(&client.properties().hardware, num_iter);
+    let (cube_dim, cube_count, is_gpu) = cube_selection(&client.properties().hardware, num_iter);
     let num_samples = *signal.shape.last().unwrap();
     let vectorization_input = client
         .io_optimized_line_sizes(&dtype)
@@ -79,6 +79,7 @@ pub fn rfft_launch<R: Runtime>(
             spectrum_re.as_tensor_arg(vectorization),
             spectrum_im.as_tensor_arg(vectorization),
             num_samples,
+            is_gpu,
             dtype,
         )
     }
@@ -91,6 +92,7 @@ pub(crate) fn rfft_kernel<F: Float>(
     spectrums_re: &mut Tensor<Line<F>>,
     spectrums_im: &mut Tensor<Line<F>>,
     #[comptime] num_samples: usize,
+    #[comptime] is_gpu: bool,
     #[define(F)] _dtype: StorageType,
 ) {
     let num_batch = signal.shape(0) * signal.shape(1);
@@ -100,7 +102,14 @@ pub(crate) fn rfft_kernel<F: Float>(
         terminate!()
     }
 
-    rfft_kernel_one_window(signal, spectrums_re, spectrums_im, batch_index, num_samples);
+    rfft_kernel_one_window(
+        signal,
+        spectrums_re,
+        spectrums_im,
+        batch_index,
+        num_samples,
+        is_gpu,
+    );
 }
 
 #[cube]
@@ -113,6 +122,7 @@ pub(crate) fn rfft_kernel_one_window<F: Float>(
     spectrums_im: &mut Tensor<Line<F>>,
     window_index: usize,
     #[comptime] num_samples: usize,
+    #[comptime] is_gpu: bool,
 ) {
     // The following code allow to ignore the batch index and assume only one window
     // - signal has shape: [num_samples]
@@ -124,9 +134,16 @@ pub(crate) fn rfft_kernel_one_window<F: Float>(
     let spectrums_re_view = spectrums_re.view_mut(spectrums_re_layout);
     let spectrums_im_view = spectrums_im.view_mut(spectrums_im_layout);
 
-    // The shared memories are not vectorized because the inner FFT compute will need to work independantly on each element
-    let mut spectrum_re = Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
-    let mut spectrum_im = Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
+    let (mut spectrum_re, mut spectrum_im) = match is_gpu {
+        true => (
+            SharedMemory::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples)),
+            SharedMemory::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples)),
+        ),
+        false => (
+            Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples)),
+            Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples)),
+        ),
+    };
 
     let line_size_input = signal_view.line_size();
 
