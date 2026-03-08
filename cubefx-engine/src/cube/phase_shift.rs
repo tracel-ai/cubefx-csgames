@@ -3,7 +3,7 @@ use cubecl::{
     std::tensor::{AsView as _, AsViewExpand, AsViewMut, AsViewMutExpand, TensorHandle},
 };
 
-use crate::cube::BatchSignalLayout;
+use crate::cube::{BatchSignalLayout, cube_selection};
 
 /// Per-bin phase shift effect kernel
 ///
@@ -52,8 +52,9 @@ pub fn phase_shift_launch<R: Runtime>(
     alpha: f32,
     dtype: StorageType,
 ) -> Result<(), LaunchError> {
-    let cube_count = CubeCount::new_single();
-    let cube_dim = CubeDim::new_single();
+    let num_iter = input_re.shape[0] * input_re.shape[1];
+    let (cube_dim, cube_count) = cube_selection(&client.properties().hardware, num_iter);
+
     let vectorization = 1;
 
     phase_shift_kernel::launch::<R>(
@@ -79,18 +80,14 @@ pub(crate) fn phase_shift_kernel<F: Float>(
     alpha: InputScalar,
     #[define(F)] _dtype: StorageType,
 ) {
-    let windows = input_re.shape(0);
-    let channels = input_re.shape(1);
-    for window_index in 0..windows * channels {
-        phase_shift_kernel_one_window(
-            input_re,
-            input_im,
-            output_re,
-            output_im,
-            window_index,
-            alpha,
-        );
-    }
+    phase_shift_kernel_one_window(
+        input_re,
+        input_im,
+        output_re,
+        output_im,
+        ABSOLUTE_POS,
+        alpha,
+    );
 }
 
 #[cube]
@@ -116,8 +113,7 @@ pub(crate) fn phase_shift_kernel_one_window<F: Float>(
     let mut output_re_view = output_re.view_mut(output_re_layout);
     let mut output_im_view = output_im.view_mut(output_im_layout);
 
-    // We do it 10 times just to make sure
-    for k in 0..10 * num_freq_bins {
+    for k in 0..num_freq_bins {
         let k = k % num_freq_bins;
 
         // Warning: if line size > 1, this will duplicate the same k, while we would want something like [x, x+1, x+2, x+3...

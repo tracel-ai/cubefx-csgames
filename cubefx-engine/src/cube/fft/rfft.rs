@@ -1,6 +1,6 @@
 use cubecl::{prelude::*, std::tensor::TensorHandle};
 
-use crate::cube::FftMode;
+use crate::cube::{FftMode, cube_selection};
 
 use cubecl::std::tensor::{
     AsView as _, AsViewExpand, AsViewMut as _, AsViewMutExpand, layout::plain::PlainLayout,
@@ -59,23 +59,32 @@ pub fn rfft_launch<R: Runtime>(
     spectrum_im: TensorHandleRef<R>,
     dtype: StorageType,
 ) -> Result<(), LaunchError> {
-    let cube_count = CubeCount::new_single();
-    let cube_dim = CubeDim::new_single();
+    let num_iter = signal.shape[0] * signal.shape[1];
+    let (cube_dim, cube_count) = cube_selection(&client.properties().hardware, num_iter);
+    let num_samples = *signal.shape.last().unwrap();
+    let vectorization_input = client
+        .io_optimized_line_sizes(&dtype)
+        .filter(|c| num_samples % c == 0)
+        .take(1)
+        .last()
+        .unwrap_or(1);
     let vectorization = 1;
 
-    rfft_kernel::launch::<R>(
-        &client,
-        cube_count,
-        cube_dim,
-        signal.as_tensor_arg(vectorization),
-        spectrum_re.as_tensor_arg(vectorization),
-        spectrum_im.as_tensor_arg(vectorization),
-        *signal.shape.last().unwrap(),
-        dtype,
-    )
+    unsafe {
+        rfft_kernel::launch_unchecked::<R>(
+            &client,
+            cube_count,
+            cube_dim,
+            signal.as_tensor_arg(vectorization_input),
+            spectrum_re.as_tensor_arg(vectorization),
+            spectrum_im.as_tensor_arg(vectorization),
+            num_samples,
+            dtype,
+        )
+    }
 }
 
-#[cube(launch)]
+#[cube(launch_unchecked)]
 /// Kernel that loops over each window and applies the RFFT on each
 pub(crate) fn rfft_kernel<F: Float>(
     signal: &Tensor<Line<F>>,
@@ -84,23 +93,14 @@ pub(crate) fn rfft_kernel<F: Float>(
     #[comptime] num_samples: usize,
     #[define(F)] _dtype: StorageType,
 ) {
-    // Shapes:
-    // - signal has shape: [windows, channels, num_samples]
-    //      with num_samples is a power of 2 larger than 8
-    // - spectrums have shape [windows, channels, num_freq_bins]
-    //      with num_freq_bins = num_samples / 2 + 1
+    let num_batch = signal.shape(0) * signal.shape(1);
+    let batch_index = ABSOLUTE_POS;
 
-    let windows = signal.shape(0);
-    let channels = signal.shape(1);
-    for window_index in 0..windows * channels {
-        rfft_kernel_one_window(
-            signal,
-            spectrums_re,
-            spectrums_im,
-            window_index,
-            num_samples,
-        );
+    if batch_index >= num_batch {
+        terminate!()
     }
+
+    rfft_kernel_one_window(signal, spectrums_re, spectrums_im, batch_index, num_samples);
 }
 
 #[cube]
@@ -125,18 +125,21 @@ pub(crate) fn rfft_kernel_one_window<F: Float>(
     let spectrums_im_view = spectrums_im.view_mut(spectrums_im_layout);
 
     // The shared memories are not vectorized because the inner FFT compute will need to work independantly on each element
-    let mut spectrum_re =
-        SharedMemory::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
-    let mut spectrum_im =
-        SharedMemory::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
+    let mut spectrum_re = Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
+    let mut spectrum_im = Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
+
+    let line_size_input = signal_view.line_size();
 
     // Load all samples of the window to shared memory
-    for i in 0..num_samples {
-        // Warning: this assumes that signal_view has lines of 1 element
-        // For larger lines, iterate over the line's content
-        // You can get the line_size of a tensor/view with .line_size()
-        spectrum_re[i] = signal_view.read(i)[0];
-        spectrum_im[i] = F::cast_from(0);
+    for i in 0..comptime!(num_samples / line_size_input) {
+        let input = signal_view.read(i * line_size_input);
+
+        #[unroll]
+        for j in 0..line_size_input {
+            let inner_index = i * line_size_input + j;
+            spectrum_re[inner_index] = input[j];
+            spectrum_im[inner_index] = F::cast_from(0);
+        }
     }
 
     fft_inner_compute(&mut spectrum_re, &mut spectrum_im, FftMode::Forward);

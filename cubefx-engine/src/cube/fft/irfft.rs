@@ -4,7 +4,7 @@ use cubecl::std::tensor::{
     AsView as _, AsViewExpand, AsViewMut as _, AsViewMutExpand, TensorHandle,
 };
 
-use crate::cube::{BatchSignalLayout, FftMode, fft_inner_compute};
+use crate::cube::{BatchSignalLayout, FftMode, cube_selection, fft_inner_compute};
 
 /// Inverse Real-valued Fast Fourier Transform kernel.
 ///
@@ -52,23 +52,27 @@ pub fn irfft_launch<R: Runtime>(
     signal: TensorHandleRef<R>,
     dtype: StorageType,
 ) -> Result<(), LaunchError> {
-    let cube_count = CubeCount::new_single();
-    let cube_dim = CubeDim::new_single();
     let vectorization = 1;
 
-    irfft_kernel::launch::<R>(
-        &client,
-        cube_count,
-        cube_dim,
-        spectrum_re.as_tensor_arg(vectorization),
-        spectrum_im.as_tensor_arg(vectorization),
-        signal.as_tensor_arg(vectorization),
-        *signal.shape.last().unwrap(),
-        dtype,
-    )
+    let num_iter = signal.shape[0] * signal.shape[1];
+    let (cube_dim, cube_count) = cube_selection(&client.properties().hardware, num_iter);
+
+    let num_sampels = *signal.shape.last().unwrap();
+    unsafe {
+        irfft_kernel::launch_unchecked::<R>(
+            &client,
+            cube_count,
+            cube_dim,
+            spectrum_re.as_tensor_arg(vectorization),
+            spectrum_im.as_tensor_arg(vectorization),
+            signal.as_tensor_arg(vectorization),
+            num_sampels,
+            dtype,
+        )
+    }
 }
 
-#[cube(launch)]
+#[cube(launch_unchecked)]
 /// Kernel that loops over each window and applies the IRFFT on each
 pub(crate) fn irfft_kernel<F: Float>(
     spectrums_re: &Tensor<Line<F>>,
@@ -77,17 +81,14 @@ pub(crate) fn irfft_kernel<F: Float>(
     #[comptime] num_samples: usize,
     #[define(F)] _dtype: StorageType,
 ) {
-    // Shapes:
-    // - spectrums have shape: [windows, channels, num_freq_bins]
-    //      with num_freq_bins = num_samples / 2 + 1
-    // - signal has shape: [windows, channels, num_samples]
-    //      with num_samples a power of 2 larger than 8
+    let num_batch = signal.shape(0) * signal.shape(1);
+    let batch_index = ABSOLUTE_POS;
 
-    let windows = signal.shape(0);
-    let channels = signal.shape(1);
-    for batch_index in 0..windows * channels {
-        irfft_kernel_one_batch(spectrums_re, spectrums_im, signal, batch_index, num_samples);
+    if batch_index >= num_batch {
+        terminate!()
     }
+
+    irfft_kernel_one_batch(spectrums_re, spectrums_im, signal, batch_index, num_samples);
 }
 
 #[cube(launch)]
@@ -115,10 +116,8 @@ pub(crate) fn irfft_kernel_one_batch<F: Float>(
     let num_freq_bins = spectrums_re_view.shape();
 
     // The shared memories are not vectorized because the inner FFT compute will need to work independantly on each element
-    let mut spectrum_re =
-        SharedMemory::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
-    let mut spectrum_im =
-        SharedMemory::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
+    let mut spectrum_re = Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
+    let mut spectrum_im = Array::<F>::new(num_samples).view_mut(PlainLayout::new(num_samples));
 
     // Load all the frequency bins to shared memory
     for i in 0..num_freq_bins {
